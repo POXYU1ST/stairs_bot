@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 import math
 from openpyxl import load_workbook
 import asyncio
+from flask import Flask, request
+import threading
 
 # Настройка логирования
 logging.basicConfig(
@@ -23,30 +25,48 @@ SELECTING_TYPE, SELECTING_CONFIG, INPUT_HEIGHT, SELECTING_STEP_SIZE = range(4)
 user_data = {}
 prices_data = None
 last_price_update = None
-PRICE_UPDATE_INTERVAL = timedelta(hours=24)  # Обновлять цены раз в 24 часа
-MESSAGES_TO_DELETE = {}  # Храним ID сообщений для удаления
+PRICE_UPDATE_INTERVAL = timedelta(hours=24)
+MESSAGES_TO_DELETE = {}
 
 # Константы расчета
-FIXED_STEP_HEIGHT = 225  # Фиксированная высота ступени 225 мм
-MAX_STRINGER_LENGTH = 4000  # Максимальная длина тетивы
+FIXED_STEP_HEIGHT = 225
+MAX_STRINGER_LENGTH = 4000
+
+# Flask app для health checks
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Telegram Stair Calculator Bot is running!"
+
+@app.route('/health')
+def health():
+    return "OK"
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    # Для будущего использования webhook
+    return "OK"
+
+def run_flask_app():
+    """Запуск Flask приложения в отдельном потоке"""
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port, debug=False)
 
 def load_prices(force_update=False):
     """Загрузка цен из Excel файла с автообновлением"""
     global prices_data, last_price_update
     
     try:
-        # Проверяем нужно ли обновлять цены
         current_time = datetime.now()
         if force_update or last_price_update is None or (current_time - last_price_update) > PRICE_UPDATE_INTERVAL:
             logger.info("Начинаем обновление цен...")
             
-            # Загружаем Excel файл
             wb = load_workbook('data.xlsx', data_only=True)
             sheet = wb.active
             
             prices = []
             
-            # Читаем данные начиная с 4 строки (пропускаем заголовки)
             for row_num in range(4, sheet.max_row + 1):
                 article = sheet.cell(row=row_num, column=1).value
                 name = sheet.cell(row=row_num, column=2).value
@@ -55,7 +75,6 @@ def load_prices(force_update=False):
                 unit = sheet.cell(row=row_num, column=5).value
                 price = sheet.cell(row=row_num, column=6).value
                 
-                # Пропускаем пустые строки
                 if article and name and price:
                     item = {
                         'article': str(article).split('.')[0] if '.' in str(article) else str(article),
@@ -146,7 +165,6 @@ async def add_message_to_delete(chat_id, message_id):
         MESSAGES_TO_DELETE[chat_id] = []
     MESSAGES_TO_DELETE[chat_id].append(message_id)
     
-    # Ограничиваем историю до 50 сообщений на чат
     if len(MESSAGES_TO_DELETE[chat_id]) > 50:
         MESSAGES_TO_DELETE[chat_id] = MESSAGES_TO_DELETE[chat_id][-50:]
 
@@ -162,7 +180,6 @@ async def cleanup_chat_history(update: Update, context: ContextTypes.DEFAULT_TYP
                 except Exception as e:
                     logger.debug(f"Не удалось удалить сообщение {message_id}: {e}")
             
-            # Очищаем список после удаления
             MESSAGES_TO_DELETE[chat_id] = []
             
         logger.info(f"История чата очищена для пользователя {update.effective_user.id}")
@@ -175,41 +192,25 @@ async def send_message_with_cleanup(update: Update, context: ContextTypes.DEFAUL
     await add_message_to_delete(update.effective_chat.id, message.message_id)
     return message
 
-async def edit_message_with_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE, text, **kwargs):
-    """Редактирование сообщения с обновлением в списке для удаления"""
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(text, **kwargs)
-        # Для callback_query сообщение уже в списке, не добавляем повторно
-
 def optimize_stringers(stringer_length):
     """Оптимизация раскроя тетивы для минимизации отходов"""
-    total_stringer_qty = 2  # Всегда 2 тетивы с каждой стороны
+    total_stringer_qty = 2
     
     if stringer_length <= 3000:
-        # Если длина тетивы до 3000 мм - используем тетивы 3000 мм
         return [{'length': 3000, 'qty': total_stringer_qty}], total_stringer_qty
     
     elif stringer_length <= 4000:
-        # Если длина тетивы до 4000 мм - используем тетивы 4000 мм
         return [{'length': 4000, 'qty': total_stringer_qty}], total_stringer_qty
     
     else:
-        # Если длина больше 4000 мм - комбинируем тетивы
-        # Пытаемся минимизировать отходы
-        combinations = []
-        
-        # Вариант 1: только 4000 мм
         qty_4000 = math.ceil(stringer_length / 4000) * total_stringer_qty
         waste_4000 = (qty_4000 * 4000) - (stringer_length * total_stringer_qty)
         
-        # Вариант 2: комбинация 4000 мм + 3000 мм
         qty_4000_combo = math.floor(stringer_length / 4000) * total_stringer_qty
         remaining_length = (stringer_length * total_stringer_qty) - (qty_4000_combo * 4000)
         qty_3000_combo = math.ceil(remaining_length / 3000) if remaining_length > 0 else 0
         waste_combo = (qty_4000_combo * 4000 + qty_3000_combo * 3000) - (stringer_length * total_stringer_qty)
         
-        # Выбираем вариант с минимальными отходами
         if waste_4000 <= waste_combo:
             return [{'length': 4000, 'qty': qty_4000}], qty_4000
         else:
@@ -225,33 +226,25 @@ def calculate_wood_stairs(height, steps_count, config, material_type, actual_ste
     materials = []
     total_cost = 0
     
-    # Расчет количества ступеней с фиксированной высотой 225 мм
     steps_count = math.ceil(height / FIXED_STEP_HEIGHT)
     actual_step_height = height / steps_count
     
-    # Расчет количества площадок
     platforms_count = 0
     if config == 'l_shape':
         platforms_count = 1
-        # Уменьшаем количество ступеней на 1 из-за площадки
         steps_count = max(1, steps_count - 1)
     elif config == 'u_shape':
         platforms_count = 2
-        # Уменьшаем количество ступеней на 2 из-за двух площадок
         steps_count = max(1, steps_count - 2)
     
-    # Расчет длины тетивы для каждого марша
-    step_depth = 300  # стандартная глубина ступени
+    step_depth = 300
     
     if config == 'straight':
-        # Прямая лестница - один марш
         stair_length = (steps_count - 1) * step_depth
         stringer_length = math.sqrt(height**2 + stair_length**2)
-        total_stringer_length = stringer_length * 2  # две тетивы
+        total_stringer_length = stringer_length * 2
         
     elif config == 'l_shape':
-        # Г-образная лестница - два марша
-        # Распределяем ступени между двумя маршами
         first_flight_steps = math.ceil(steps_count / 2)
         second_flight_steps = steps_count - first_flight_steps
         
@@ -266,9 +259,7 @@ def calculate_wood_stairs(height, steps_count, config, material_type, actual_ste
         
         total_stringer_length = (first_stringer_length + second_stringer_length) * 2
         
-    else:  # u_shape
-        # П-образная лестница - три марша (два основных + площадка)
-        # Распределяем ступени между тремя маршами
+    else:
         flights_steps = math.ceil(steps_count / 3)
         remaining_steps = steps_count - flights_steps * 2
         if remaining_steps < 0:
@@ -279,12 +270,10 @@ def calculate_wood_stairs(height, steps_count, config, material_type, actual_ste
         flight_length = (flights_steps - 1) * step_depth
         
         flight_stringer_length = math.sqrt(flight_height**2 + flight_length**2)
-        total_stringer_length = flight_stringer_length * 4  # два марша по две тетивы
+        total_stringer_length = flight_stringer_length * 4
     
-    # Оптимизированный расчет тетив
     stringers_optimized, total_stringer_qty = optimize_stringers(total_stringer_length / 2)
     
-    # Добавляем тетивы в материалы
     for stringer in stringers_optimized:
         stringer_price = get_material_price(material_type, f'Тетива {stringer["length"]}', 10215 if stringer["length"] == 4000 else 9518)
         stringer_cost = stringer_price * stringer["qty"]
@@ -298,7 +287,6 @@ def calculate_wood_stairs(height, steps_count, config, material_type, actual_ste
         })
         total_cost += stringer_cost
     
-    # Ступени
     step_price = get_material_price(material_type, f'СТУПЕНЬ ПРЯМАЯ {step_width}', 1500)
     step_cost = steps_count * step_price
     
@@ -311,7 +299,6 @@ def calculate_wood_stairs(height, steps_count, config, material_type, actual_ste
     })
     total_cost += step_cost
     
-    # Подступенки
     riser_price = get_material_price(material_type, f'Подступенок {step_width}', 600)
     riser_cost = steps_count * riser_price
     
@@ -324,9 +311,7 @@ def calculate_wood_stairs(height, steps_count, config, material_type, actual_ste
     })
     total_cost += riser_cost
     
-    # Площадки для Г-образных и П-образных лестниц
     if platforms_count > 0:
-        # Определяем размер площадки в зависимости от ширины ступени
         platform_size = 1000 if step_width in ["900", "1000"] else 1200
         platform_price = get_material_price(material_type, f'Площадка {platform_size}', 8000 if platform_size == 1000 else 9500)
         platform_cost = platforms_count * platform_price
@@ -340,7 +325,6 @@ def calculate_wood_stairs(height, steps_count, config, material_type, actual_ste
         })
         total_cost += platform_cost
     
-    # Столбы
     post_price = get_material_price(material_type, 'Столб', 1931)
     if config == 'straight':
         posts_qty = 2
@@ -360,9 +344,8 @@ def calculate_wood_stairs(height, steps_count, config, material_type, actual_ste
     })
     total_cost += posts_cost
     
-    # Балясины
     baluster_price = get_material_price(material_type, 'Балясина', 400)
-    balusters_qty = steps_count + platforms_count  # добавляем балясины для площадок
+    balusters_qty = steps_count + platforms_count
     balusters_cost = balusters_qty * baluster_price
     
     materials.append({
@@ -374,8 +357,7 @@ def calculate_wood_stairs(height, steps_count, config, material_type, actual_ste
     })
     total_cost += balusters_cost
     
-    # Поручень
-    handrail_length = total_stringer_length / 2  # длина поручня равна длине тетивы
+    handrail_length = total_stringer_length / 2
     handrail_qty = math.ceil(handrail_length / 3000)
     handrail_price = get_material_price(material_type, 'ПОРУЧЕНЬ', 2108)
     handrail_cost = handrail_qty * handrail_price
@@ -410,11 +392,9 @@ def calculate_modular_stairs(height, steps_count, config, material_type, actual_
     materials = []
     total_cost = 0
     
-    # Расчет количества ступеней с фиксированной высотой 225 мм
     steps_count = math.ceil(height / FIXED_STEP_HEIGHT)
     actual_step_height = height / steps_count
     
-    # Корректировка количества ступеней с учетом площадок
     platforms_count = 0
     if config == 'l_shape':
         platforms_count = 1
@@ -423,7 +403,6 @@ def calculate_modular_stairs(height, steps_count, config, material_type, actual_
         platforms_count = 2
         steps_count = max(1, steps_count - 2)
     
-    # Элементы каркаса
     support_1000 = get_material_by_article('15762374')
     support_2000 = get_material_by_article('15762382')
     
@@ -447,7 +426,6 @@ def calculate_modular_stairs(height, steps_count, config, material_type, actual_
         })
         total_cost += support_2000['price']
     
-    # Модули
     module_price = get_material_price(material_type, 'Промежуточный элемент', 4076)
     modules_qty = steps_count - 1
     modules_cost = modules_qty * module_price
@@ -461,7 +439,6 @@ def calculate_modular_stairs(height, steps_count, config, material_type, actual_
     })
     total_cost += modules_cost
     
-    # Верхний/нижний элемент
     end_module_price = get_material_price(material_type, 'Верхний и нижний элемент', 7590)
     materials.append({
         'name': 'Верхний и нижний элемент',
@@ -472,7 +449,6 @@ def calculate_modular_stairs(height, steps_count, config, material_type, actual_
     })
     total_cost += end_module_price
     
-    # Угловые элементы
     corner_element = get_material_by_article('15762391')
     if corner_element:
         if config == 'l_shape':
@@ -494,7 +470,6 @@ def calculate_modular_stairs(height, steps_count, config, material_type, actual_
             })
             total_cost += corner_element['price'] * 2
     
-    # Площадки
     if platforms_count > 0:
         platform_price = get_material_price(material_type, 'Площадка', 8000)
         materials.append({
@@ -506,7 +481,6 @@ def calculate_modular_stairs(height, steps_count, config, material_type, actual_
         })
         total_cost += platform_price * platforms_count
     
-    # Ступени
     step_price = get_material_price(material_type, f'СТУПЕНЬ ПРЯМАЯ {step_width}', 1500)
     step_cost = steps_count * step_price
     
@@ -519,7 +493,6 @@ def calculate_modular_stairs(height, steps_count, config, material_type, actual_
     })
     total_cost += step_cost
     
-    # Ограждение
     railing_price = get_material_price(material_type, 'Опора под поручень', 900)
     railing_qty = steps_count + platforms_count
     railing_cost = railing_qty * railing_price
@@ -533,7 +506,6 @@ def calculate_modular_stairs(height, steps_count, config, material_type, actual_
     })
     total_cost += railing_cost
     
-    # Поручень
     handrail_length = math.sqrt(height**2 + (steps_count * 300)**2) / 1000
     handrail_qty = math.ceil(handrail_length / 3)
     handrail_price = get_material_price(material_type, 'ПОРУЧЕНЬ', 2108)
@@ -563,7 +535,6 @@ def calculate_modular_stairs(height, steps_count, config, material_type, actual_
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
-    # Очищаем историю при старте
     await cleanup_chat_history(update, context)
     
     if prices_data is None:
@@ -592,7 +563,6 @@ async def restart_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    # Очищаем историю
     chat_id = query.message.chat_id
     if chat_id in MESSAGES_TO_DELETE:
         for message_id in MESSAGES_TO_DELETE[chat_id]:
@@ -629,7 +599,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     if query.data == "calculate_stairs":
-        # Очищаем историю при начале нового расчета
         await cleanup_chat_history(update, context)
         
         user_id = query.from_user.id
@@ -661,7 +630,6 @@ async def select_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     user_choice = update.message.text
     user_id = update.effective_user.id
     
-    # Добавляем сообщение пользователя в список для удаления
     await add_message_to_delete(update.effective_chat.id, update.message.message_id)
     
     if user_choice == "🔄 Перезапустить":
@@ -694,7 +662,6 @@ async def select_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     user_choice = update.message.text
     user_id = update.effective_user.id
     
-    # Добавляем сообщение пользователя в список для удаления
     await add_message_to_delete(update.effective_chat.id, update.message.message_id)
     
     if user_choice == "🔄 Перезапустить":
@@ -726,7 +693,6 @@ async def input_height(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     user_input = update.message.text
     user_id = update.effective_user.id
     
-    # Добавляем сообщение пользователя в список для удаления
     await add_message_to_delete(update.effective_chat.id, update.message.message_id)
     
     if user_input == "🔄 Перезапустить":
@@ -741,11 +707,9 @@ async def input_height(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     height = result
     user_data[user_id]['height'] = height
     
-    # Расчет количества ступеней с фиксированной высотой 225 мм
     steps_count = math.ceil(height / FIXED_STEP_HEIGHT)
     actual_step_height = height / steps_count
     
-    # Корректируем количество ступеней для модульных лестниц с площадками
     if user_data[user_id]['type'] == 'modular':
         config = user_data[user_id]['config']
         if config == 'l_shape':
@@ -781,7 +745,6 @@ async def select_step_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user_choice = update.message.text
     user_id = update.effective_user.id
     
-    # Добавляем сообщение пользователя в список для удаления
     await add_message_to_delete(update.effective_chat.id, update.message.message_id)
     
     if user_choice == "🔄 Перезапустить":
@@ -802,16 +765,13 @@ async def select_step_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     actual_step_height = user_data[user_id]['step_height']
     material_type = user_data[user_id]['material_type']
     
-    # Показываем сообщение о расчете
     calculating_msg = await send_message_with_cleanup(update, context, "🔄 Произвожу расчет...")
     
-    # Выполняем расчет
     if stair_type == 'wood':
         result = calculate_wood_stairs(height, steps_count, config, material_type, actual_step_height, step_width)
     else:
         result = calculate_modular_stairs(height, steps_count, config, material_type, actual_step_height, step_width)
     
-    # Удаляем сообщение "Произвожу расчет"
     try:
         await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=calculating_msg.message_id)
     except:
@@ -822,7 +782,6 @@ async def select_step_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def send_calculation_result(update: Update, context: ContextTypes.DEFAULT_TYPE, result):
     """Отправка результата расчета"""
-    # Очищаем всю предыдущую историю перед показом результата
     await cleanup_chat_history(update, context)
     
     type_name = "Деревянная" if result['type'] == 'wood' else "Модульная"
@@ -868,7 +827,6 @@ async def send_calculation_result(update: Update, context: ContextTypes.DEFAULT_
     message_text += "\n_*Примечание:* В расчете используется фиксированная высота ступени 225 мм_\n"
     message_text += "_Расчет является предварительным. Для точного расчета обратитесь к менеджеру._"
     
-    # Клавиатура для нового расчета
     keyboard = [
         [InlineKeyboardButton("🔄 Новый расчет", callback_data="calculate_stairs")],
         [InlineKeyboardButton("🔄 Перезапустить", callback_data="restart")]
@@ -934,7 +892,12 @@ def main():
     # Загружаем цены при старте
     load_prices()
     
-    # Создаем приложение
+    # Запускаем Flask в отдельном потоке
+    flask_thread = threading.Thread(target=run_flask_app, daemon=True)
+    flask_thread.start()
+    logger.info("Flask server started in background thread")
+    
+    # Создаем приложение Telegram бота
     application = Application.builder().token(token).build()
     
     # Обработчик диалога
@@ -960,8 +923,8 @@ def main():
     application.add_error_handler(error_handler)
     
     # Запускаем бота
-    logger.info("Бот запущен")
-    application.run_polling()
+    logger.info("Telegram bot starting...")
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
