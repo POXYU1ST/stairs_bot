@@ -17,7 +17,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Состояния диалога
-SELECTING_TYPE, SELECTING_CONFIG, INPUT_HEIGHT, SELECTING_STEP_SIZE = range(4)
+SELECTING_TYPE, SELECTING_CONFIG, INPUT_HEIGHT, SELECTING_STEP_SIZE, SEARCH_MATERIAL = range(5)
 
 # Глобальные переменные для хранения данных
 user_data = {}
@@ -124,6 +124,25 @@ def get_material_by_article(article):
     except Exception as e:
         logger.error(f"Ошибка поиска по артикулу {article}: {e}")
         return None
+
+def search_materials_by_article_or_name(search_term):
+    """Поиск материалов по артикулу или названию"""
+    if not prices_data:
+        return []
+    
+    try:
+        search_term = search_term.lower().strip()
+        results = []
+        
+        for item in prices_data:
+            if (search_term in item['article'].lower() or 
+                search_term in item['name'].lower()):
+                results.append(item)
+        
+        return results
+    except Exception as e:
+        logger.error(f"Ошибка поиска материалов: {e}")
+        return []
 
 def validate_input(value, min_val, max_val, field_name):
     """Проверка ввода на адекватность"""
@@ -521,13 +540,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         f"👋 Добро пожаловать, {user.first_name}!\n"
         "Я твой помощник в расчете лестниц.\n\n"
-        "📋 *Выберите тип лестницы:*\n"
-        "• 🏠 *Деревянная* - из отдельных элементов\n"
-        "• ⚡ *Модульная* - металлическая система"
+        "📋 *Доступные функции:*\n"
+        "• 🏠 *Расчет лестницы* - полный расчет стоимости\n"
+        "• 🔍 *Поиск материала* - найти материал по артикулу или названию\n\n"
+        "Выберите действие:"
     )
     
     keyboard = [
         [InlineKeyboardButton("🔄 Рассчитать лестницу", callback_data="calculate_stairs")],
+        [InlineKeyboardButton("🔍 Найти материал", callback_data="search_material")],
         [InlineKeyboardButton("🔄 Перезапустить", callback_data="restart")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -557,13 +578,15 @@ async def restart_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         f"👋 Добро пожаловать, {user.first_name}!\n"
         "Я твой помощник в расчете лестниц.\n\n"
-        "📋 *Выберите тип лестницы:*\n"
-        "• 🏠 *Деревянная* - из отдельных элементов\n"
-        "• ⚡ *Модульная* - металлическая система"
+        "📋 *Доступные функции:*\n"
+        "• 🏠 *Расчет лестницы* - полный расчет стоимости\n"
+        "• 🔍 *Поиск материала* - найти материал по артикулу или названию\n\n"
+        "Выберите действие:"
     )
     
     keyboard = [
         [InlineKeyboardButton("🔄 Рассчитать лестницу", callback_data="calculate_stairs")],
+        [InlineKeyboardButton("🔍 Найти материал", callback_data="search_material")],
         [InlineKeyboardButton("🔄 Перезапустить", callback_data="restart")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -584,7 +607,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         reply_keyboard = [
             ["🏠 Деревянная", "⚡ Модульная"],
-            ["🔄 Перезапустить"]
+            ["🔍 Найти материал", "🔄 Перезапустить"]
         ]
         
         message = await context.bot.send_message(
@@ -599,8 +622,91 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await add_message_to_delete(query.message.chat_id, message.message_id)
         return SELECTING_TYPE
     
+    elif query.data == "search_material":
+        await cleanup_chat_history(update, context)
+        
+        reply_keyboard = [["🔄 Перезапустить"]]
+        
+        message = await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="🔍 *ПОИСК МАТЕРИАЛА*\n\n"
+                 "Введите артикул или название материала для поиска:\n\n"
+                 "Примеры:\n"
+                 "• `15762294` - поиск по артикулу\n"
+                 "• `Ступень` - поиск по названию\n"
+                 "• `Тетива` - поиск по названию",
+            reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True),
+            parse_mode='Markdown'
+        )
+        await add_message_to_delete(query.message.chat_id, message.message_id)
+        return SEARCH_MATERIAL
+    
     elif query.data == "restart":
         await restart_bot(update, context)
+
+async def search_material(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Поиск материала по артикулу или названию"""
+    search_term = update.message.text
+    user_id = update.effective_user.id
+    
+    await add_message_to_delete(update.effective_chat.id, update.message.message_id)
+    
+    if search_term == "🔄 Перезапустить":
+        await restart_from_message(update, context)
+        return ConversationHandler.END
+    
+    if not search_term.strip():
+        await send_message_with_cleanup(update, context, "❌ Пожалуйста, введите артикул или название для поиска")
+        return SEARCH_MATERIAL
+    
+    search_msg = await send_message_with_cleanup(update, context, "🔍 Ищу материалы...")
+    
+    results = search_materials_by_article_or_name(search_term)
+    
+    try:
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=search_msg.message_id)
+    except:
+        pass
+    
+    if not results:
+        await send_message_with_cleanup(
+            update, context,
+            f"❌ Материалы по запросу '{search_term}' не найдены.\n\n"
+            "Попробуйте:\n"
+            "• Проверить правильность артикула\n"
+            "• Использовать другое название\n"
+            "• Упростить запрос"
+        )
+        return SEARCH_MATERIAL
+    
+    message_text = f"🔍 *РЕЗУЛЬТАТЫ ПОИСКА* ('{search_term}')\n\n"
+    
+    for i, item in enumerate(results[:10], 1):  # Ограничиваем вывод 10 результатами
+        message_text += (
+            f"*{i}. {item['name']}*\n"
+            f"📋 Артикул: `{item['article']}`\n"
+            f"🏷 Тип: {item['stair_type']}\n"
+            f"📏 Размеры: {item.get('sizes', 'не указаны')}\n"
+            f"💰 Цена: {item['price']:,.0f} ₽\n"
+            f"📦 Ед. изм.: {item['unit']}\n\n"
+        )
+    
+    if len(results) > 10:
+        message_text += f"*... и еще {len(results) - 10} материалов*"
+    
+    message_text += "\n_Для нового поиска введите артикул или название_"
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Новый поиск", callback_data="search_material")],
+        [InlineKeyboardButton("🏠 Расчет лестницы", callback_data="calculate_stairs")],
+        [InlineKeyboardButton("🔄 Перезапустить", callback_data="restart")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    message = await update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode='Markdown')
+    await add_message_to_delete(update.effective_chat.id, message.message_id)
+    
+    return ConversationHandler.END
 
 async def select_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Выбор типа лестницы"""
@@ -613,6 +719,24 @@ async def select_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await restart_from_message(update, context)
         return ConversationHandler.END
     
+    if user_choice == "🔍 Найти материал":
+        await cleanup_chat_history(update, context)
+        
+        reply_keyboard = [["🔄 Перезапустить"]]
+        
+        await send_message_with_cleanup(
+            update, context,
+            "🔍 *ПОИСК МАТЕРИАЛА*\n\n"
+            "Введите артикул или название материала для поиска:\n\n"
+            "Примеры:\n"
+            "• `15762294` - поиск по артикулу\n"
+            "• `Ступень` - поиск по названию\n"
+            "• `Тетива` - поиск по названию",
+            reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True),
+            parse_mode='Markdown'
+        )
+        return SEARCH_MATERIAL
+    
     user_data[user_id] = {
         'type': 'wood' if 'Деревянная' in user_choice else 'modular',
         'material_type': 'деревянная' if 'Деревянная' in user_choice else 'металлическая'
@@ -620,7 +744,7 @@ async def select_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     
     reply_keyboard = [
         ["📏 Прямая", "📐 Г-образная", "🔄 П-образная"],
-        ["🔄 Перезапустить"]
+        ["🔍 Найти материал", "🔄 Перезапустить"]
     ]
     
     await send_message_with_cleanup(
@@ -645,21 +769,42 @@ async def select_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await restart_from_message(update, context)
         return ConversationHandler.END
     
+    if user_choice == "🔍 Найти материал":
+        await cleanup_chat_history(update, context)
+        
+        reply_keyboard = [["🔄 Перезапустить"]]
+        
+        await send_message_with_cleanup(
+            update, context,
+            "🔍 *ПОИСК МАТЕРИАЛА*\n\n"
+            "Введите артикул или название материала для поиска:\n\n"
+            "Примеры:\n"
+            "• `15762294` - поиск по артикулу\n"
+            "• `Ступень` - поиск по названию\n"
+            "• `Тетива` - поиск по названию",
+            reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True),
+            parse_mode='Markdown'
+        )
+        return SEARCH_MATERIAL
+    
     config_map = {
-        "📏 Прямая": "straight",
-        "📐 Г-образная": "l_shape", 
-        "🔄 П-образная": "u_shape"
+        '📏 Прямая': 'straight',
+        '📐 Г-образная': 'l_shape', 
+        '🔄 П-образная': 'u_shape'
     }
     
-    user_data[user_id]['config'] = config_map.get(user_choice, 'straight')
+    user_data[user_id]['config'] = config_map[user_choice]
     
     reply_keyboard = [["🔄 Перезапустить"]]
     
     await send_message_with_cleanup(
         update, context,
         "📏 *Введите высоту лестницы (мм):*\n\n"
-        "Пример: 2800 (для высоты 2.8 метра)\n"
-        "Диапазон: 1000-5000 мм",
+        "Примеры:\n"
+        "• 2700 - для высоты 2.7 метра\n" 
+        "• 3000 - для высоты 3 метра\n"
+        "• 3500 - для высоты 3.5 метра\n\n"
+        "📝 *Рекомендация:* Высота измеряется от чистого пола нижнего этажа до чистого пола верхнего этажа",
         reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True),
         parse_mode='Markdown'
     )
@@ -667,151 +812,153 @@ async def select_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 async def input_height(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Ввод высоты лестницы"""
-    user_input = update.message.text
+    height_input = update.message.text
     user_id = update.effective_user.id
     
     await add_message_to_delete(update.effective_chat.id, update.message.message_id)
     
-    if user_input == "🔄 Перезапустить":
+    if height_input == "🔄 Перезапустить":
         await restart_from_message(update, context)
         return ConversationHandler.END
     
-    is_valid, result = validate_input(user_input, 1000, 5000, "Высота")
+    is_valid, result = validate_input(height_input, 1000, 5000, "Высота лестницы")
+    
     if not is_valid:
         await send_message_with_cleanup(update, context, result)
         return INPUT_HEIGHT
     
-    height = result
-    user_data[user_id]['height'] = height
-    
-    steps_count = math.ceil(height / FIXED_STEP_HEIGHT)
-    actual_step_height = height / steps_count
-    
-    if user_data[user_id]['type'] == 'modular':
-        config = user_data[user_id]['config']
-        if config == 'l_shape':
-            steps_count = max(3, steps_count + 1)
-        elif config == 'u_shape':
-            steps_count = max(3, steps_count + 2)
-    
-    user_data[user_id]['steps_count'] = steps_count
-    user_data[user_id]['step_height'] = actual_step_height
+    user_data[user_id]['height'] = result
     
     reply_keyboard = [
         ["900", "1000", "1200"],
-        ["🔄 Перезапустить"]
+        ["🔍 Найти материал", "🔄 Перезапустить"]
     ]
     
     await send_message_with_cleanup(
         update, context,
-        f"📊 *Расчет ступеней:*\n\n"
-        f"• Высота: {height} мм\n"
-        f"• Количество ступеней: {steps_count}\n"
-        f"• Высота ступени: {actual_step_height:.1f} мм\n\n"
-        f"📏 *Выберите ширину ступени:*\n"
-        f"• 900 мм - компактная\n"
-        f"• 1000 мм - стандартная\n"
-        f"• 1200 мм - широкая",
+        "📐 *Выберите ширину ступени:*\n\n"
+        "• 900 мм - компактный вариант\n"
+        "• 1000 мм - стандартная ширина\n"
+        "• 1200 мм - просторная лестница",
         reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True),
         parse_mode='Markdown'
     )
     return SELECTING_STEP_SIZE
 
 async def select_step_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Выбор ширины ступени и расчет"""
-    user_choice = update.message.text
+    """Выбор ширины ступени"""
+    step_width = update.message.text
     user_id = update.effective_user.id
     
     await add_message_to_delete(update.effective_chat.id, update.message.message_id)
     
-    if user_choice == "🔄 Перезапустить":
+    if step_width == "🔄 Перезапустить":
         await restart_from_message(update, context)
         return ConversationHandler.END
     
-    if user_choice not in ["900", "1000", "1200"]:
+    if step_width == "🔍 Найти материал":
+        await cleanup_chat_history(update, context)
+        
+        reply_keyboard = [["🔄 Перезапустить"]]
+        
+        await send_message_with_cleanup(
+            update, context,
+            "🔍 *ПОИСК МАТЕРИАЛА*\n\n"
+            "Введите артикул или название материала для поиска:\n\n"
+            "Примеры:\n"
+            "• `15762294` - поиск по артикулу\n"
+            "• `Ступень` - поиск по названию\n"
+            "• `Тетива` - поиск по названию",
+            reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True),
+            parse_mode='Markdown'
+        )
+        return SEARCH_MATERIAL
+    
+    if step_width not in ["900", "1000", "1200"]:
         await send_message_with_cleanup(update, context, "❌ Пожалуйста, выберите ширину ступени из предложенных вариантов")
         return SELECTING_STEP_SIZE
     
-    step_width = user_choice
     user_data[user_id]['step_width'] = step_width
     
-    stair_type = user_data[user_id]['type']
-    config = user_data[user_id]['config']
-    height = user_data[user_id]['height']
-    steps_count = user_data[user_id]['steps_count']
-    actual_step_height = user_data[user_id]['step_height']
-    material_type = user_data[user_id]['material_type']
+    calculation_msg = await send_message_with_cleanup(update, context, "🧮 *Выполняю расчет...*", parse_mode='Markdown')
     
-    calculating_msg = await send_message_with_cleanup(update, context, "🔄 Произвожу расчет...")
-    
-    if stair_type == 'wood':
-        result = calculate_wood_stairs(height, steps_count, config, material_type, actual_step_height, step_width)
-    else:
-        result = calculate_modular_stairs(height, steps_count, config, material_type, actual_step_height, step_width)
+    user_input = user_data[user_id]
     
     try:
-        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=calculating_msg.message_id)
-    except:
-        pass
-    
-    await send_calculation_result(update, context, result)
-    return ConversationHandler.END
-
-async def send_calculation_result(update: Update, context: ContextTypes.DEFAULT_TYPE, result):
-    """Отправка результата расчета"""
-    await cleanup_chat_history(update, context)
-    
-    type_name = "Деревянная" if result['type'] == 'wood' else "Модульная"
-    config_names = {
-        'straight': 'Прямая',
-        'l_shape': 'Г-образная', 
-        'u_shape': 'П-образная'
-    }
-    
-    message_text = (
-        f"🏠 *РАСЧЕТ ЛЕСТНИЦЫ*\n\n"
-        f"📋 *Тип:* {type_name}\n"
-        f"📐 *Конфигурация:* {config_names[result['config']]}\n"
-        f"📏 *Высота:* {result['height']} мм\n"
-        f"🪜 *Количество ступеней:* {result['steps_count']}\n"
-        f"📐 *Высота ступени:* {result['step_height']:.1f} мм\n"
-        f"📏 *Ширина ступени:* {result['step_width']} мм\n\n"
-    )
-    
-    if result['type'] == 'wood' and result.get('platforms_count', 0) > 0:
-        message_text += f"🔄 *Количество площадок:* {result['platforms_count']}\n"
-    
-    if result['type'] == 'wood':
-        message_text += f"📏 *Длина тетивы:* {result['stringer_length']:.0f} мм\n"
-        message_text += f"🔢 *Количество тетив:* {result['stringer_qty']} шт.\n\n"
-    
-    message_text += "📦 *СОСТАВ КОМПЛЕКТА:*\n\n"
-    
-    for material in result['materials']:
-        message_text += f"• {material['name']}\n"
-        message_text += f"  Кол-во: {material['qty']} {material['unit']}\n"
-        message_text += f"  Цена: {material['price']:,.0f} ₽\n"
-        message_text += f"  Сумма: {material['total']:,.0f} ₽\n\n"
-    
-    message_text += f"💰 *ОБЩАЯ СТОИМОСТЬ:* {result['total_cost']:,.0f} ₽\n\n"
-    
-    if result['type'] == 'wood' and 'stringers_detail' in result:
-        message_text += "📐 *РАСКРОЙ ТЕТИВЫ:*\n"
-        for stringer in result['stringers_detail']:
-            message_text += f"• Тетива {stringer['length']} мм: {stringer['qty']} шт.\n"
-        message_text += f"\n*Оптимизировано для минимизации отходов*\n"
-    
-    message_text += "\n_*Примечание:* В расчете используется фиксированная высота ступени 225 мм_\n"
-    message_text += "_Расчет является предварительным. Для точного расчета обратитесь к менеджеру._"
-    
-    keyboard = [
-        [InlineKeyboardButton("🔄 Новый расчет", callback_data="calculate_stairs")],
-        [InlineKeyboardButton("🔄 Перезапустить", callback_data="restart")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    message = await update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode='Markdown')
-    await add_message_to_delete(update.effective_chat.id, message.message_id)
+        if user_input['type'] == 'wood':
+            result = calculate_wood_stairs(
+                height=user_input['height'],
+                steps_count=0,
+                config=user_input['config'],
+                material_type=user_input['material_type'],
+                actual_step_height=FIXED_STEP_HEIGHT,
+                step_width=user_input['step_width']
+            )
+        else:
+            result = calculate_modular_stairs(
+                height=user_input['height'],
+                steps_count=0,
+                config=user_input['config'],
+                material_type=user_input['material_type'],
+                actual_step_height=FIXED_STEP_HEIGHT,
+                step_width=user_input['step_width']
+            )
+        
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=calculation_msg.message_id)
+        
+        config_names = {
+            'straight': 'Прямая',
+            'l_shape': 'Г-образная', 
+            'u_shape': 'П-образная'
+        }
+        
+        type_names = {
+            'wood': 'Деревянная',
+            'modular': 'Модульная'
+        }
+        
+        result_text = (
+            f"📊 *РЕЗУЛЬТАТ РАСЧЕТА*\n\n"
+            f"🏷 *Тип:* {type_names[result['type']]}\n"
+            f"📐 *Конфигурация:* {config_names[result['config']]}\n"
+            f"📏 *Высота:* {result['height']:,} мм\n"
+            f"📐 *Ширина ступени:* {result['step_width']} мм\n"
+            f"🪜 *Количество ступеней:* {result['steps_count']}\n"
+            f"📏 *Высота ступени:* {result['step_height']:.1f} мм\n"
+        )
+        
+        if result['type'] == 'wood':
+            result_text += f"📏 *Длина тетивы:* {result['stringer_length']:.0f} мм\n"
+            result_text += f"🔢 *Количество тетив:* {result['stringer_qty']} шт\n"
+        
+        if result['platforms_count'] > 0:
+            result_text += f"🟦 *Количество площадок:* {result['platforms_count']}\n"
+        
+        result_text += f"\n📦 *МАТЕРИАЛЫ:*\n"
+        
+        for material in result['materials']:
+            result_text += f"• {material['name']}: {material['qty']} {material['unit']} × {material['price']:,.0f} ₽ = {material['total']:,.0f} ₽\n"
+        
+        result_text += f"\n💰 *ОБЩАЯ СТОИМОСТЬ:* {result['total_cost']:,.0f} ₽\n\n"
+        result_text += "_*Примечание:* Стоимость указана без учета доставки и монтажа_\n"
+        
+        keyboard = [
+            [InlineKeyboardButton("🔄 Новый расчет", callback_data="calculate_stairs")],
+            [InlineKeyboardButton("🔍 Поиск материала", callback_data="search_material")],
+            [InlineKeyboardButton("🔄 Перезапустить", callback_data="restart")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        message = await update.message.reply_text(result_text, reply_markup=reply_markup, parse_mode='Markdown')
+        await add_message_to_delete(update.effective_chat.id, message.message_id)
+        
+        return ConversationHandler.END
+        
+    except Exception as e:
+        logger.error(f"Ошибка расчета: {e}")
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=calculation_msg.message_id)
+        await send_message_with_cleanup(update, context, f"❌ Произошла ошибка при расчете: {str(e)}")
+        return ConversationHandler.END
 
 async def restart_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Перезапуск из состояния диалога"""
@@ -821,16 +968,19 @@ async def restart_from_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if user_id in user_data:
         del user_data[user_id]
     
+    user = update.effective_user
     welcome_text = (
-        f"👋 Добро пожаловать, {update.effective_user.first_name}!\n"
+        f"👋 Добро пожаловать, {user.first_name}!\n"
         "Я твой помощник в расчете лестниц.\n\n"
-        "📋 *Выберите тип лестницы:*\n"
-        "• 🏠 *Деревянная* - из отдельных элементов\n"
-        "• ⚡ *Модульная* - металлическая система"
+        "📋 *Доступные функции:*\n"
+        "• 🏠 *Расчет лестницы* - полный расчет стоимости\n"
+        "• 🔍 *Поиск материала* - найти материал по артикулу или названию\n\n"
+        "Выберите действие:"
     )
     
     keyboard = [
         [InlineKeyboardButton("🔄 Рассчитать лестницу", callback_data="calculate_stairs")],
+        [InlineKeyboardButton("🔍 Найти материал", callback_data="search_material")],
         [InlineKeyboardButton("🔄 Перезапустить", callback_data="restart")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -846,7 +996,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if user_id in user_data:
         del user_data[user_id]
     
-    await send_message_with_cleanup(update, context, "❌ Расчет отменен.")
+    await send_message_with_cleanup(update, context, "Диалог отменен. Используйте /start для начала нового расчета.")
     return ConversationHandler.END
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -854,49 +1004,43 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Ошибка: {context.error}", exc_info=context.error)
     
     try:
-        await send_message_with_cleanup(update, context, "❌ Произошла ошибка. Пожалуйста, попробуйте снова.")
+        await send_message_with_cleanup(update, context, "❌ Произошла ошибка. Пожалуйста, попробуйте еще раз или используйте /start для перезапуска.")
     except:
         pass
 
 def main():
-    """Основная функция"""
-    # Загружаем токен из переменных окружения
-    token = os.getenv('TELEGRAM_BOT_TOKEN')
-    if not token:
-        logger.error("TELEGRAM_BOT_TOKEN не найден в переменных окружения")
-        return
-    
-    # Загружаем цены при старте
+    """Основная функция запуска бота"""
     load_prices()
     
-    # Создаем приложение
-    application = Application.builder().token(token).build()
+    application = Application.builder().token("YOUR_BOT_TOKEN_HERE").build()
     
-    # Обработчик диалога
     conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler, pattern="^calculate_stairs$")],
+        entry_points=[
+            CommandHandler('start', start),
+            CallbackQueryHandler(button_handler, pattern='^(calculate_stairs|search_material)$')
+        ],
         states={
             SELECTING_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_type)],
             SELECTING_CONFIG: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_config)],
             INPUT_HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_height)],
             SELECTING_STEP_SIZE: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_step_size)],
+            SEARCH_MATERIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_material)],
         },
         fallbacks=[
-            CommandHandler("start", start),
-            CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex("^🔄 Перезапустить$"), restart_from_message)
+            CommandHandler('cancel', cancel),
+            CommandHandler('start', start),
+            CallbackQueryHandler(restart_bot, pattern='^restart$'),
+            CallbackQueryHandler(button_handler, pattern='^(calculate_stairs|search_material)$')
         ],
+        allow_reentry=True
     )
     
-    # Добавляем обработчики
-    application.add_handler(CommandHandler("start", start))
     application.add_handler(conv_handler)
-    application.add_handler(CallbackQueryHandler(restart_bot, pattern="^restart$"))
+    application.add_handler(CallbackQueryHandler(restart_bot, pattern='^restart$'))
     application.add_error_handler(error_handler)
     
-    # Запускаем бота
-    logger.info("Бот запущен")
-    application.run_polling(drop_pending_updates=True)
+    print("Бот запущен...")
+    application.run_polling()
 
 if __name__ == '__main__':
     main()
