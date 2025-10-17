@@ -180,6 +180,44 @@ async def edit_message_with_cleanup(update: Update, context: ContextTypes.DEFAUL
         await update.callback_query.edit_message_text(text, **kwargs)
         # Для callback_query сообщение уже в списке, не добавляем повторно
 
+def optimize_stringers(stringer_length):
+    """Оптимизация раскроя тетивы для минимизации отходов"""
+    total_stringer_qty = 2  # Всегда 2 тетивы с каждой стороны
+    
+    if stringer_length <= 3000:
+        # Если длина тетивы до 3000 мм - используем тетивы 3000 мм
+        return [{'length': 3000, 'qty': total_stringer_qty}], total_stringer_qty
+    
+    elif stringer_length <= 4000:
+        # Если длина тетивы до 4000 мм - используем тетивы 4000 мм
+        return [{'length': 4000, 'qty': total_stringer_qty}], total_stringer_qty
+    
+    else:
+        # Если длина больше 4000 мм - комбинируем тетивы
+        # Пытаемся минимизировать отходы
+        combinations = []
+        
+        # Вариант 1: только 4000 мм
+        qty_4000 = math.ceil(stringer_length / 4000) * total_stringer_qty
+        waste_4000 = (qty_4000 * 4000) - (stringer_length * total_stringer_qty)
+        
+        # Вариант 2: комбинация 4000 мм + 3000 мм
+        qty_4000_combo = math.floor(stringer_length / 4000) * total_stringer_qty
+        remaining_length = (stringer_length * total_stringer_qty) - (qty_4000_combo * 4000)
+        qty_3000_combo = math.ceil(remaining_length / 3000) if remaining_length > 0 else 0
+        waste_combo = (qty_4000_combo * 4000 + qty_3000_combo * 3000) - (stringer_length * total_stringer_qty)
+        
+        # Выбираем вариант с минимальными отходами
+        if waste_4000 <= waste_combo:
+            return [{'length': 4000, 'qty': qty_4000}], qty_4000
+        else:
+            result = []
+            if qty_4000_combo > 0:
+                result.append({'length': 4000, 'qty': qty_4000_combo})
+            if qty_3000_combo > 0:
+                result.append({'length': 3000, 'qty': qty_3000_combo})
+            return result, qty_4000_combo + qty_3000_combo
+
 def calculate_wood_stairs(height, steps_count, config, material_type, actual_step_height, step_width):
     """Расчет деревянной лестницы с фиксированной высотой ступени 225 мм"""
     materials = []
@@ -194,21 +232,22 @@ def calculate_wood_stairs(height, steps_count, config, material_type, actual_ste
     stair_length = (steps_count - 1) * step_depth
     stringer_length = math.sqrt(height**2 + stair_length**2)
     
-    # Расчет количества тетив (округляем в большую сторону)
-    stringer_qty_per_side = math.ceil(stringer_length / MAX_STRINGER_LENGTH)
-    total_stringer_qty = stringer_qty_per_side * 2  # по две тетивы с каждой стороны
+    # Оптимизированный расчет тетив
+    stringers_optimized, total_stringer_qty = optimize_stringers(stringer_length)
     
-    stringer_price = get_material_price(material_type, 'Тетива 4000', 10215)
-    stringer_cost = stringer_price * total_stringer_qty
-    
-    materials.append({
-        'name': f'Тетива 4000мм',
-        'qty': total_stringer_qty,
-        'unit': 'шт.',
-        'price': stringer_price,
-        'total': stringer_cost
-    })
-    total_cost += stringer_cost
+    # Добавляем тетивы в материалы
+    for stringer in stringers_optimized:
+        stringer_price = get_material_price(material_type, f'Тетива {stringer["length"]}', 10215 if stringer["length"] == 4000 else 9518)
+        stringer_cost = stringer_price * stringer["qty"]
+        
+        materials.append({
+            'name': f'Тетива {stringer["length"]}мм',
+            'qty': stringer["qty"],
+            'unit': 'шт.',
+            'price': stringer_price,
+            'total': stringer_cost
+        })
+        total_cost += stringer_cost
     
     # Ступени
     step_price = get_material_price(material_type, f'СТУПЕНЬ ПРЯМАЯ {step_width}', 1500)
@@ -285,28 +324,7 @@ def calculate_wood_stairs(height, steps_count, config, material_type, actual_ste
     })
     total_cost += handrail_cost
     
-    # Крепеж
-    fixing_kit_price = 1500
-    fixing_kit_qty = max(1, steps_count // 10)
-    materials.append({
-        'name': 'Крепежный комплект',
-        'qty': fixing_kit_qty,
-        'unit': 'компл.',
-        'price': fixing_kit_price,
-        'total': fixing_kit_price * fixing_kit_qty
-    })
-    total_cost += fixing_kit_price * fixing_kit_qty
-    
-    screws_price = 5
-    screws_qty = steps_count * 12
-    materials.append({
-        'name': 'Саморезы',
-        'qty': screws_qty,
-        'unit': 'шт.',
-        'price': screws_price,
-        'total': screws_price * screws_qty
-    })
-    total_cost += screws_price * screws_qty
+    # Убрали монтажный комплект и саморезы из расчета
     
     return {
         'type': 'wood',
@@ -317,6 +335,7 @@ def calculate_wood_stairs(height, steps_count, config, material_type, actual_ste
         'step_height': actual_step_height,
         'stringer_length': stringer_length,
         'stringer_qty': total_stringer_qty,
+        'stringers_detail': stringers_optimized,
         'posts_count': posts_qty,
         'materials': materials,
         'total_cost': total_cost
@@ -755,55 +774,53 @@ async def send_calculation_result(update: Update, context: ContextTypes.DEFAULT_
         f"📐 *Конфигурация:* {config_names[result['config']]}\n"
         f"📏 *Высота:* {result['height']} мм\n"
         f"🪜 *Количество ступеней:* {result['steps_count']}\n"
-        f"📊 *Высота ступени:* {result['step_height']:.1f} мм\n"
+        f"📐 *Высота ступени:* {result['step_height']:.1f} мм\n"
+        f"📏 *Ширина ступени:* {result['step_width']} мм\n\n"
     )
     
-    if result['type'] == 'modular' and result.get('platforms_count', 0) > 0:
-        message_text += f"🔄 *Количество площадок:* {result['platforms_count']}\n"
-    
     if result['type'] == 'wood':
-        message_text += f"📐 *Длина тетивы:* {result['stringer_length']:.0f} мм\n"
-        message_text += f"🔢 *Количество тетив:* {result['stringer_qty']} шт.\n"
-        message_text += f"🏗️ *Количество столбов:* {result['posts_count']}\n"
+        message_text += f"📏 *Длина тетивы:* {result['stringer_length']:.0f} мм\n"
+        message_text += f"🔢 *Количество тетив:* {result['stringer_qty']} шт.\n\n"
     
-    message_text += f"\n💎 *МАТЕРИАЛЫ:*\n\n"
+    message_text += "📦 *СОСТАВ КОМПЛЕКТА:*\n\n"
     
-    total_cost = 0
     for material in result['materials']:
         message_text += f"• {material['name']}\n"
         message_text += f"  Кол-во: {material['qty']} {material['unit']}\n"
-        message_text += f"  Цена: {material['price']} руб.\n"
-        message_text += f"  Сумма: {material['total']} руб.\n\n"
-        total_cost += material['total']
+        message_text += f"  Цена: {material['price']:,.0f} ₽\n"
+        message_text += f"  Сумма: {material['total']:,.0f} ₽\n\n"
     
-    message_text += f"💰 *ОБЩАЯ СТОИМОСТЬ:* {total_cost:,.0f} руб.\n\n"
-    message_text += f"_*Цены актуальны на {datetime.now().strftime('%d.%m.%Y')}_\n"
-    message_text += "_*Стоимость является ориентировочной_"
+    message_text += f"💰 *ОБЩАЯ СТОИМОСТЬ:* {result['total_cost']:,.0f} ₽\n\n"
     
-    # Отправляем результат (это сообщение НЕ добавляем в список для удаления)
-    await update.message.reply_text(message_text, parse_mode='Markdown')
+    if result['type'] == 'wood' and 'stringers_detail' in result:
+        message_text += "📐 *РАСКРОЙ ТЕТИВЫ:*\n"
+        for stringer in result['stringers_detail']:
+            message_text += f"• Тетива {stringer['length']} мм: {stringer['qty']} шт.\n"
+        message_text += f"\n*Оптимизировано для минимизации отходов*\n"
     
+    message_text += "\n_*Примечание:* В расчете используется фиксированная высота ступени 225 мм_\n"
+    message_text += "_Расчет является предварительным. Для точного расчета обратитесь к менеджеру._"
+    
+    # Клавиатура для нового расчета
     keyboard = [
         [InlineKeyboardButton("🔄 Новый расчет", callback_data="calculate_stairs")],
         [InlineKeyboardButton("🔄 Перезапустить", callback_data="restart")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Это сообщение тоже НЕ добавляем в список для удаления
-    await update.message.reply_text("Хотите выполнить новый расчет?", reply_markup=reply_markup)
+    message = await update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode='Markdown')
+    await add_message_to_delete(update.effective_chat.id, message.message_id)
 
 async def restart_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Перезапуск из состояния ConversationHandler"""
-    # Очищаем историю
+    """Перезапуск из состояния диалога"""
     await cleanup_chat_history(update, context)
     
-    user = update.effective_user
-    user_id = user.id
+    user_id = update.effective_user.id
     if user_id in user_data:
         del user_data[user_id]
     
     welcome_text = (
-        f"👋 Добро пожаловать, {user.first_name}!\n"
+        f"👋 Добро пожаловать, {update.effective_user.first_name}!\n"
         "Я твой помощник в расчете лестниц.\n\n"
         "📋 *Выберите тип лестницы:*\n"
         "• 🏠 *Деревянная* - из отдельных элементов\n"
@@ -821,46 +838,41 @@ async def restart_from_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Отмена диалога"""
-    await send_message_with_cleanup(update, context, "Расчет отменен.")
+    await cleanup_chat_history(update, context)
+    
+    user_id = update.effective_user.id
+    if user_id in user_data:
+        del user_data[user_id]
+    
+    await send_message_with_cleanup(update, context, "❌ Расчет отменен.")
     return ConversationHandler.END
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик ошибок"""
     logger.error(f"Ошибка: {context.error}", exc_info=context.error)
-    if update and update.effective_message:
-        await send_message_with_cleanup(update, context, "❌ Произошла ошибка. Используйте /start для перезапуска.")
-
-async def scheduled_price_update(context: ContextTypes.DEFAULT_TYPE):
-    """Плановое обновление цен"""
-    logger.info("Запуск планового обновления цен...")
-    load_prices(force_update=True)
-    logger.info("Плановое обновление цен завершено")
+    
+    try:
+        await send_message_with_cleanup(update, context, "❌ Произошла ошибка. Пожалуйста, попробуйте снова.")
+    except:
+        pass
 
 def main():
-    """Основная функция запуска бота"""
+    """Основная функция"""
+    # Загружаем токен из переменных окружения
     token = os.getenv('TELEGRAM_BOT_TOKEN')
     if not token:
-        logger.error("❌ TELEGRAM_BOT_TOKEN не найден!")
+        logger.error("TELEGRAM_BOT_TOKEN не найден в переменных окружения")
         return
     
-    # Загружаем цены при запуске
+    # Загружаем цены при старте
     load_prices()
     
     # Создаем приложение
     application = Application.builder().token(token).build()
     
-    # Настраиваем планировщик для автообновления цен
-    job_queue = application.job_queue
-    if job_queue:
-        # Обновлять цены каждые 24 часа
-        job_queue.run_repeating(scheduled_price_update, interval=86400, first=10)
-    
-    # Настраиваем обработчики
+    # Обработчик диалога
     conv_handler = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(button_handler, pattern="^calculate_stairs$"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, select_type)
-        ],
+        entry_points=[CallbackQueryHandler(button_handler, pattern="^calculate_stairs$")],
         states={
             SELECTING_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_type)],
             SELECTING_CONFIG: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_config)],
@@ -868,27 +880,21 @@ def main():
             SELECTING_STEP_SIZE: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_step_size)],
         },
         fallbacks=[
-            CommandHandler("cancel", cancel),
             CommandHandler("start", start),
-            MessageHandler(filters.TEXT & filters.Regex("^🔄 Перезапустить$"), restart_from_message)
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex("^🔄 Перезапустить$"), restart_from_message)
         ],
     )
     
+    # Добавляем обработчики
     application.add_handler(CommandHandler("start", start))
     application.add_handler(conv_handler)
-    application.add_handler(CallbackQueryHandler(button_handler, pattern="^(calculate_stairs|restart)$"))
-    
-    # Обработчик ошибок
+    application.add_handler(CallbackQueryHandler(restart_bot, pattern="^restart$"))
     application.add_error_handler(error_handler)
     
-    logger.info("🤖 Бот запущен...")
-    
     # Запускаем бота
-    application.run_polling(
-        poll_interval=1,
-        timeout=20,
-        drop_pending_updates=True
-    )
+    logger.info("Бот запущен")
+    application.run_polling()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
