@@ -1,3 +1,2 @@
 python-telegram-bot==13.7
 openpyxl==3.1.2
-requests==2.31.0
