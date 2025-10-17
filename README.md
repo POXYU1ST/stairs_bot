@@ -1,1 +1,0 @@
-# stairs_bot
