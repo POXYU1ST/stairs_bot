@@ -8,8 +8,6 @@ from datetime import datetime, timedelta
 import math
 from openpyxl import load_workbook
 import asyncio
-from flask import Flask, request
-import threading
 
 # Настройка логирования
 logging.basicConfig(
@@ -31,27 +29,6 @@ MESSAGES_TO_DELETE = {}
 # Константы расчета
 FIXED_STEP_HEIGHT = 225
 MAX_STRINGER_LENGTH = 4000
-
-# Flask app для health checks
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Telegram Stair Calculator Bot is running!"
-
-@app.route('/health')
-def health():
-    return "OK"
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    # Для будущего использования webhook
-    return "OK"
-
-def run_flask_app():
-    """Запуск Flask приложения в отдельном потоке"""
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port, debug=False)
 
 def load_prices(force_update=False):
     """Загрузка цен из Excel файла с автообновлением"""
@@ -892,12 +869,7 @@ def main():
     # Загружаем цены при старте
     load_prices()
     
-    # Запускаем Flask в отдельном потоке
-    flask_thread = threading.Thread(target=run_flask_app, daemon=True)
-    flask_thread.start()
-    logger.info("Flask server started in background thread")
-    
-    # Создаем приложение Telegram бота
+    # Создаем приложение
     application = Application.builder().token(token).build()
     
     # Обработчик диалога
@@ -923,7 +895,7 @@ def main():
     application.add_error_handler(error_handler)
     
     # Запускаем бота
-    logger.info("Telegram bot starting...")
+    logger.info("Бот запущен")
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
