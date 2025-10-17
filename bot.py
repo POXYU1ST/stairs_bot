@@ -93,6 +93,8 @@ def get_test_data():
         {'article': '83850939', 'name': 'Поручень 3000мм', 'stair_type': 'деревянная', 'price': 2108, 'unit': 'штука'},
         {'article': '89426866', 'name': 'Столб Хюгге', 'stair_type': 'деревянная', 'price': 1931, 'unit': 'штука'},
         {'article': '89426868', 'name': 'Балясина Хюгге', 'stair_type': 'деревянная', 'price': 400, 'unit': 'штука'},
+        {'article': 'platform_1000', 'name': 'Площадка 1000x1000', 'stair_type': 'деревянная', 'price': 8000, 'unit': 'штука'},
+        {'article': 'platform_1200', 'name': 'Площадка 1200x1200', 'stair_type': 'деревянная', 'price': 9500, 'unit': 'штука'},
     ]
     logger.info("Используются тестовые данные")
     return test_data
@@ -227,13 +229,60 @@ def calculate_wood_stairs(height, steps_count, config, material_type, actual_ste
     steps_count = math.ceil(height / FIXED_STEP_HEIGHT)
     actual_step_height = height / steps_count
     
-    # Расчет длины тетивы
+    # Расчет количества площадок
+    platforms_count = 0
+    if config == 'l_shape':
+        platforms_count = 1
+        # Уменьшаем количество ступеней на 1 из-за площадки
+        steps_count = max(1, steps_count - 1)
+    elif config == 'u_shape':
+        platforms_count = 2
+        # Уменьшаем количество ступеней на 2 из-за двух площадок
+        steps_count = max(1, steps_count - 2)
+    
+    # Расчет длины тетивы для каждого марша
     step_depth = 300  # стандартная глубина ступени
-    stair_length = (steps_count - 1) * step_depth
-    stringer_length = math.sqrt(height**2 + stair_length**2)
+    
+    if config == 'straight':
+        # Прямая лестница - один марш
+        stair_length = (steps_count - 1) * step_depth
+        stringer_length = math.sqrt(height**2 + stair_length**2)
+        total_stringer_length = stringer_length * 2  # две тетивы
+        
+    elif config == 'l_shape':
+        # Г-образная лестница - два марша
+        # Распределяем ступени между двумя маршами
+        first_flight_steps = math.ceil(steps_count / 2)
+        second_flight_steps = steps_count - first_flight_steps
+        
+        first_flight_height = first_flight_steps * actual_step_height
+        second_flight_height = second_flight_steps * actual_step_height
+        
+        first_flight_length = (first_flight_steps - 1) * step_depth
+        second_flight_length = (second_flight_steps - 1) * step_depth
+        
+        first_stringer_length = math.sqrt(first_flight_height**2 + first_flight_length**2)
+        second_stringer_length = math.sqrt(second_flight_height**2 + second_flight_length**2)
+        
+        total_stringer_length = (first_stringer_length + second_stringer_length) * 2
+        
+    else:  # u_shape
+        # П-образная лестница - три марша (два основных + площадка)
+        # Распределяем ступени между тремя маршами
+        flights_steps = math.ceil(steps_count / 3)
+        remaining_steps = steps_count - flights_steps * 2
+        if remaining_steps < 0:
+            flights_steps = math.ceil(steps_count / 2)
+            remaining_steps = steps_count - flights_steps
+        
+        flight_height = flights_steps * actual_step_height
+        flight_length = (flights_steps - 1) * step_depth
+        
+        flight_stringer_length = math.sqrt(flight_height**2 + flight_length**2)
+        total_stringer_length = flight_stringer_length * 4  # два марша по две тетивы
     
     # Оптимизированный расчет тетив
-    stringers_optimized, total_stringer_qty = optimize_stringers(stringer_length)
+    stringers_optimized, total_stringer_qty = optimize_stringers(total_stringer_length / 2)
     
     # Добавляем тетивы в материалы
     for stringer in stringers_optimized:
@@ -275,6 +324,22 @@ def calculate_wood_stairs(height, steps_count, config, material_type, actual_ste
     })
     total_cost += riser_cost
     
+    # Площадки для Г-образных и П-образных лестниц
+    if platforms_count > 0:
+        # Определяем размер площадки в зависимости от ширины ступени
+        platform_size = 1000 if step_width in ["900", "1000"] else 1200
+        platform_price = get_material_price(material_type, f'Площадка {platform_size}', 8000 if platform_size == 1000 else 9500)
+        platform_cost = platforms_count * platform_price
+        
+        materials.append({
+            'name': f'Площадка {platform_size}×{platform_size}мм',
+            'qty': platforms_count,
+            'unit': 'шт.',
+            'price': platform_price,
+            'total': platform_cost
+        })
+        total_cost += platform_cost
+    
     # Столбы
     post_price = get_material_price(material_type, 'Столб', 1931)
     if config == 'straight':
@@ -297,7 +362,7 @@ def calculate_wood_stairs(height, steps_count, config, material_type, actual_ste
     
     # Балясины
     baluster_price = get_material_price(material_type, 'Балясина', 400)
-    balusters_qty = steps_count
+    balusters_qty = steps_count + platforms_count  # добавляем балясины для площадок
     balusters_cost = balusters_qty * baluster_price
     
     materials.append({
@@ -310,7 +375,7 @@ def calculate_wood_stairs(height, steps_count, config, material_type, actual_ste
     total_cost += balusters_cost
     
     # Поручень
-    handrail_length = stringer_length
+    handrail_length = total_stringer_length / 2  # длина поручня равна длине тетивы
     handrail_qty = math.ceil(handrail_length / 3000)
     handrail_price = get_material_price(material_type, 'ПОРУЧЕНЬ', 2108)
     handrail_cost = handrail_qty * handrail_price
@@ -324,16 +389,15 @@ def calculate_wood_stairs(height, steps_count, config, material_type, actual_ste
     })
     total_cost += handrail_cost
     
-    # Убрали монтажный комплект и саморезы из расчета
-    
     return {
         'type': 'wood',
         'config': config,
         'height': height,
         'step_width': step_width,
         'steps_count': steps_count,
+        'platforms_count': platforms_count,
         'step_height': actual_step_height,
-        'stringer_length': stringer_length,
+        'stringer_length': total_stringer_length / 2,
         'stringer_qty': total_stringer_qty,
         'stringers_detail': stringers_optimized,
         'posts_count': posts_qty,
@@ -777,6 +841,9 @@ async def send_calculation_result(update: Update, context: ContextTypes.DEFAULT_
         f"📐 *Высота ступени:* {result['step_height']:.1f} мм\n"
         f"📏 *Ширина ступени:* {result['step_width']} мм\n\n"
     )
+    
+    if result['type'] == 'wood' and result.get('platforms_count', 0) > 0:
+        message_text += f"🔄 *Количество площадок:* {result['platforms_count']}\n"
     
     if result['type'] == 'wood':
         message_text += f"📏 *Длина тетивы:* {result['stringer_length']:.0f} мм\n"
