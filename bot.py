@@ -4,9 +4,10 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import math
 from openpyxl import load_workbook
+import asyncio
 
 # Настройка логирования
 logging.basicConfig(
@@ -21,42 +22,57 @@ SELECTING_TYPE, SELECTING_CONFIG, INPUT_HEIGHT, SELECTING_STEP_SIZE = range(4)
 # Глобальные переменные для хранения данных
 user_data = {}
 prices_data = None
+last_price_update = None
+PRICE_UPDATE_INTERVAL = timedelta(hours=24)  # Обновлять цены раз в 24 часа
+MESSAGES_TO_DELETE = {}  # Храним ID сообщений для удаления
 
-def load_prices():
-    """Загрузка цен из Excel файла без pandas"""
-    global prices_data
+# Константы расчета
+FIXED_STEP_HEIGHT = 225  # Фиксированная высота ступени 225 мм
+MAX_STRINGER_LENGTH = 4000  # Максимальная длина тетивы
+
+def load_prices(force_update=False):
+    """Загрузка цен из Excel файла с автообновлением"""
+    global prices_data, last_price_update
     
     try:
-        # Загружаем Excel файл
-        wb = load_workbook('data.xlsx', data_only=True)
-        sheet = wb.active
-        
-        prices = []
-        
-        # Читаем данные начиная с 4 строки (пропускаем заголовки)
-        for row_num in range(4, sheet.max_row + 1):
-            article = sheet.cell(row=row_num, column=1).value
-            name = sheet.cell(row=row_num, column=2).value
-            stair_type = sheet.cell(row=row_num, column=3).value
-            sizes = sheet.cell(row=row_num, column=4).value
-            unit = sheet.cell(row=row_num, column=5).value
-            price = sheet.cell(row=row_num, column=6).value
+        # Проверяем нужно ли обновлять цены
+        current_time = datetime.now()
+        if force_update or last_price_update is None or (current_time - last_price_update) > PRICE_UPDATE_INTERVAL:
+            logger.info("Начинаем обновление цен...")
             
-            # Пропускаем пустые строки
-            if article and name and price:
-                item = {
-                    'article': str(article).split('.')[0] if '.' in str(article) else str(article),
-                    'name': str(name),
-                    'stair_type': str(stair_type) if stair_type else '',
-                    'sizes': str(sizes) if sizes else '',
-                    'unit': str(unit) if unit else 'шт.',
-                    'price': float(price) if price else 0
-                }
-                prices.append(item)
-        
-        prices_data = prices
-        logger.info(f"Успешно загружено {len(prices)} позиций из Excel")
-        
+            # Загружаем Excel файл
+            wb = load_workbook('data.xlsx', data_only=True)
+            sheet = wb.active
+            
+            prices = []
+            
+            # Читаем данные начиная с 4 строки (пропускаем заголовки)
+            for row_num in range(4, sheet.max_row + 1):
+                article = sheet.cell(row=row_num, column=1).value
+                name = sheet.cell(row=row_num, column=2).value
+                stair_type = sheet.cell(row=row_num, column=3).value
+                sizes = sheet.cell(row=row_num, column=4).value
+                unit = sheet.cell(row=row_num, column=5).value
+                price = sheet.cell(row=row_num, column=6).value
+                
+                # Пропускаем пустые строки
+                if article and name and price:
+                    item = {
+                        'article': str(article).split('.')[0] if '.' in str(article) else str(article),
+                        'name': str(name),
+                        'stair_type': str(stair_type) if stair_type else '',
+                        'sizes': str(sizes) if sizes else '',
+                        'unit': str(unit) if unit else 'шт.',
+                        'price': float(price) if price else 0
+                    }
+                    prices.append(item)
+            
+            prices_data = prices
+            last_price_update = current_time
+            logger.info(f"Успешно загружено {len(prices)} позиций из Excel")
+        else:
+            logger.info("Используем кэшированные цены")
+            
     except Exception as e:
         logger.error(f"Ошибка загрузки прайса: {e}")
         prices_data = get_test_data()
@@ -122,35 +138,72 @@ def validate_input(value, min_val, max_val, field_name):
     except ValueError:
         return False, "❌ Пожалуйста, введите число"
 
-# ОСТАВЬТЕ ВСЕ ФУНКЦИИ РАСЧЕТА БЕЗ ИЗМЕНЕНИЙ:
-# calculate_wood_stairs, calculate_modular_stairs и т.д.
-# Они используют get_material_price и get_material_by_article которые мы обновили
+async def add_message_to_delete(chat_id, message_id):
+    """Добавляем сообщение в список для удаления"""
+    if chat_id not in MESSAGES_TO_DELETE:
+        MESSAGES_TO_DELETE[chat_id] = []
+    MESSAGES_TO_DELETE[chat_id].append(message_id)
+    
+    # Ограничиваем историю до 50 сообщений на чат
+    if len(MESSAGES_TO_DELETE[chat_id]) > 50:
+        MESSAGES_TO_DELETE[chat_id] = MESSAGES_TO_DELETE[chat_id][-50:]
+
+async def cleanup_chat_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Очистка истории чата"""
+    try:
+        chat_id = update.effective_chat.id
+        
+        if chat_id in MESSAGES_TO_DELETE:
+            for message_id in MESSAGES_TO_DELETE[chat_id]:
+                try:
+                    await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+                except Exception as e:
+                    logger.debug(f"Не удалось удалить сообщение {message_id}: {e}")
+            
+            # Очищаем список после удаления
+            MESSAGES_TO_DELETE[chat_id] = []
+            
+        logger.info(f"История чата очищена для пользователя {update.effective_user.id}")
+    except Exception as e:
+        logger.error(f"Ошибка при очистке истории чата: {e}")
+
+async def send_message_with_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE, text, **kwargs):
+    """Отправка сообщения с автоматическим добавлением в список для удаления"""
+    message = await update.message.reply_text(text, **kwargs)
+    await add_message_to_delete(update.effective_chat.id, message.message_id)
+    return message
+
+async def edit_message_with_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE, text, **kwargs):
+    """Редактирование сообщения с обновлением в списке для удаления"""
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(text, **kwargs)
+        # Для callback_query сообщение уже в списке, не добавляем повторно
 
 def calculate_wood_stairs(height, steps_count, config, material_type, actual_step_height, step_width):
-    """Расчет деревянной лестницы"""
+    """Расчет деревянной лестницы с фиксированной высотой ступени 225 мм"""
     materials = []
     total_cost = 0
     
-    # Расчет длины тетивы с учетом оптимального угла 30-40 градусов
-    step_depth = 300
+    # Расчет количества ступеней с фиксированной высотой 225 мм
+    steps_count = math.ceil(height / FIXED_STEP_HEIGHT)
+    actual_step_height = height / steps_count
+    
+    # Расчет длины тетивы
+    step_depth = 300  # стандартная глубина ступени
     stair_length = (steps_count - 1) * step_depth
     stringer_length = math.sqrt(height**2 + stair_length**2)
     
-    # Определяем количество и длину тетив
-    stringer_qty = 2
+    # Расчет количества тетив (округляем в большую сторону)
+    stringer_qty_per_side = math.ceil(stringer_length / MAX_STRINGER_LENGTH)
+    total_stringer_qty = stringer_qty_per_side * 2  # по две тетивы с каждой стороны
     
-    if stringer_length <= 3000:
-        stringer_size = "3000"
-        stringer_price = get_material_price(material_type, 'Тетива 3000', 9518)
-    else:
-        stringer_size = "4000" 
-        stringer_price = get_material_price(material_type, 'Тетива 4000', 10215)
-    
-    stringer_cost = stringer_price * stringer_qty
+    stringer_price = get_material_price(material_type, 'Тетива 4000', 10215)
+    stringer_cost = stringer_price * total_stringer_qty
     
     materials.append({
-        'name': f'Тетива {stringer_size}мм',
-        'qty': stringer_qty,
+        'name': f'Тетива 4000мм',
+        'qty': total_stringer_qty,
         'unit': 'шт.',
         'price': stringer_price,
         'total': stringer_cost
@@ -263,15 +316,20 @@ def calculate_wood_stairs(height, steps_count, config, material_type, actual_ste
         'steps_count': steps_count,
         'step_height': actual_step_height,
         'stringer_length': stringer_length,
+        'stringer_qty': total_stringer_qty,
         'posts_count': posts_qty,
         'materials': materials,
         'total_cost': total_cost
     }
 
 def calculate_modular_stairs(height, steps_count, config, material_type, actual_step_height, step_width):
-    """Расчет модульной лестницы"""
+    """Расчет модульной лестницы с фиксированной высотой ступени 225 мм"""
     materials = []
     total_cost = 0
+    
+    # Расчет количества ступеней с фиксированной высотой 225 мм
+    steps_count = math.ceil(height / FIXED_STEP_HEIGHT)
+    actual_step_height = height / steps_count
     
     # Корректировка количества ступеней с учетом площадок
     platforms_count = 0
@@ -420,11 +478,11 @@ def calculate_modular_stairs(height, steps_count, config, material_type, actual_
         'total_cost': total_cost
     }
 
-# ОСТАВЬТЕ ВСЕ ФУНКЦИИ БОТА БЕЗ ИЗМЕНЕНИЙ:
-# start, restart_bot, button_handler, select_type, select_config, input_height, select_step_size, send_calculation_result
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
+    # Очищаем историю при старте
+    await cleanup_chat_history(update, context)
+    
     if prices_data is None:
         load_prices()
     
@@ -443,12 +501,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
+    message = await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
+    await add_message_to_delete(update.effective_chat.id, message.message_id)
 
 async def restart_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Перезапуск бота"""
     query = update.callback_query
     await query.answer()
+    
+    # Очищаем историю
+    chat_id = query.message.chat_id
+    if chat_id in MESSAGES_TO_DELETE:
+        for message_id in MESSAGES_TO_DELETE[chat_id]:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except Exception as e:
+                logger.debug(f"Не удалось удалить сообщение {message_id}: {e}")
+        MESSAGES_TO_DELETE[chat_id] = []
     
     user = query.from_user
     user_id = user.id
@@ -477,6 +546,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     if query.data == "calculate_stairs":
+        # Очищаем историю при начале нового расчета
+        await cleanup_chat_history(update, context)
+        
         user_id = query.from_user.id
         if user_id not in user_data:
             user_data[user_id] = {}
@@ -486,7 +558,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ["🔄 Перезапустить"]
         ]
         
-        await context.bot.send_message(
+        message = await context.bot.send_message(
             chat_id=query.message.chat_id,
             text="👋 Добро пожаловать!\n\n"
                  "📋 *Выберите тип лестницы:*\n"
@@ -495,6 +567,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True),
             parse_mode='Markdown'
         )
+        await add_message_to_delete(query.message.chat_id, message.message_id)
         return SELECTING_TYPE
     
     elif query.data == "restart":
@@ -504,6 +577,9 @@ async def select_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     """Выбор типа лестницы"""
     user_choice = update.message.text
     user_id = update.effective_user.id
+    
+    # Добавляем сообщение пользователя в список для удаления
+    await add_message_to_delete(update.effective_chat.id, update.message.message_id)
     
     if user_choice == "🔄 Перезапустить":
         await restart_from_message(update, context)
@@ -519,7 +595,8 @@ async def select_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         ["🔄 Перезапустить"]
     ]
     
-    await update.message.reply_text(
+    await send_message_with_cleanup(
+        update, context,
         "📐 *Выберите конфигурацию лестницы:*\n\n"
         "• 📏 *Прямая* - одномаршевая лестница\n"
         "• 📐 *Г-образная* - с поворотом на 90°\n" 
@@ -533,6 +610,9 @@ async def select_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     """Выбор конфигурации лестницы"""
     user_choice = update.message.text
     user_id = update.effective_user.id
+    
+    # Добавляем сообщение пользователя в список для удаления
+    await add_message_to_delete(update.effective_chat.id, update.message.message_id)
     
     if user_choice == "🔄 Перезапустить":
         await restart_from_message(update, context)
@@ -548,7 +628,8 @@ async def select_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     
     reply_keyboard = [["🔄 Перезапустить"]]
     
-    await update.message.reply_text(
+    await send_message_with_cleanup(
+        update, context,
         "📏 *Введите высоту лестницы (мм):*\n\n"
         "Пример: 2800 (для высоты 2.8 метра)\n"
         "Диапазон: 1000-5000 мм",
@@ -562,21 +643,26 @@ async def input_height(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     user_input = update.message.text
     user_id = update.effective_user.id
     
+    # Добавляем сообщение пользователя в список для удаления
+    await add_message_to_delete(update.effective_chat.id, update.message.message_id)
+    
     if user_input == "🔄 Перезапустить":
         await restart_from_message(update, context)
         return ConversationHandler.END
     
     is_valid, result = validate_input(user_input, 1000, 5000, "Высота")
     if not is_valid:
-        await update.message.reply_text(result)
+        await send_message_with_cleanup(update, context, result)
         return INPUT_HEIGHT
     
     height = result
     user_data[user_id]['height'] = height
     
-    optimal_step_height = 180
-    steps_count = round(height / optimal_step_height)
+    # Расчет количества ступеней с фиксированной высотой 225 мм
+    steps_count = math.ceil(height / FIXED_STEP_HEIGHT)
+    actual_step_height = height / steps_count
     
+    # Корректируем количество ступеней для модульных лестниц с площадками
     if user_data[user_id]['type'] == 'modular':
         config = user_data[user_id]['config']
         if config == 'l_shape':
@@ -584,7 +670,6 @@ async def input_height(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         elif config == 'u_shape':
             steps_count = max(3, steps_count + 2)
     
-    actual_step_height = height / steps_count
     user_data[user_id]['steps_count'] = steps_count
     user_data[user_id]['step_height'] = actual_step_height
     
@@ -593,7 +678,8 @@ async def input_height(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         ["🔄 Перезапустить"]
     ]
     
-    await update.message.reply_text(
+    await send_message_with_cleanup(
+        update, context,
         f"📊 *Расчет ступеней:*\n\n"
         f"• Высота: {height} мм\n"
         f"• Количество ступеней: {steps_count}\n"
@@ -612,12 +698,15 @@ async def select_step_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user_choice = update.message.text
     user_id = update.effective_user.id
     
+    # Добавляем сообщение пользователя в список для удаления
+    await add_message_to_delete(update.effective_chat.id, update.message.message_id)
+    
     if user_choice == "🔄 Перезапустить":
         await restart_from_message(update, context)
         return ConversationHandler.END
     
     if user_choice not in ["900", "1000", "1200"]:
-        await update.message.reply_text("❌ Пожалуйста, выберите ширину ступени из предложенных вариантов")
+        await send_message_with_cleanup(update, context, "❌ Пожалуйста, выберите ширину ступени из предложенных вариантов")
         return SELECTING_STEP_SIZE
     
     step_width = user_choice
@@ -630,16 +719,29 @@ async def select_step_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     actual_step_height = user_data[user_id]['step_height']
     material_type = user_data[user_id]['material_type']
     
+    # Показываем сообщение о расчете
+    calculating_msg = await send_message_with_cleanup(update, context, "🔄 Произвожу расчет...")
+    
+    # Выполняем расчет
     if stair_type == 'wood':
         result = calculate_wood_stairs(height, steps_count, config, material_type, actual_step_height, step_width)
     else:
         result = calculate_modular_stairs(height, steps_count, config, material_type, actual_step_height, step_width)
     
-    await send_calculation_result(update, result)
+    # Удаляем сообщение "Произвожу расчет"
+    try:
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=calculating_msg.message_id)
+    except:
+        pass
+    
+    await send_calculation_result(update, context, result)
     return ConversationHandler.END
 
-async def send_calculation_result(update: Update, result):
+async def send_calculation_result(update: Update, context: ContextTypes.DEFAULT_TYPE, result):
     """Отправка результата расчета"""
+    # Очищаем всю предыдущую историю перед показом результата
+    await cleanup_chat_history(update, context)
+    
     type_name = "Деревянная" if result['type'] == 'wood' else "Модульная"
     config_names = {
         'straight': 'Прямая',
@@ -661,6 +763,7 @@ async def send_calculation_result(update: Update, result):
     
     if result['type'] == 'wood':
         message_text += f"📐 *Длина тетивы:* {result['stringer_length']:.0f} мм\n"
+        message_text += f"🔢 *Количество тетив:* {result['stringer_qty']} шт.\n"
         message_text += f"🏗️ *Количество столбов:* {result['posts_count']}\n"
     
     message_text += f"\n💎 *МАТЕРИАЛЫ:*\n\n"
@@ -677,6 +780,7 @@ async def send_calculation_result(update: Update, result):
     message_text += f"_*Цены актуальны на {datetime.now().strftime('%d.%m.%Y')}_\n"
     message_text += "_*Стоимость является ориентировочной_"
     
+    # Отправляем результат (это сообщение НЕ добавляем в список для удаления)
     await update.message.reply_text(message_text, parse_mode='Markdown')
     
     keyboard = [
@@ -685,10 +789,14 @@ async def send_calculation_result(update: Update, result):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
+    # Это сообщение тоже НЕ добавляем в список для удаления
     await update.message.reply_text("Хотите выполнить новый расчет?", reply_markup=reply_markup)
 
 async def restart_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Перезапуск из состояния ConversationHandler"""
+    # Очищаем историю
+    await cleanup_chat_history(update, context)
+    
     user = update.effective_user
     user_id = user.id
     if user_id in user_data:
@@ -708,18 +816,25 @@ async def restart_from_message(update: Update, context: ContextTypes.DEFAULT_TYP
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
+    message = await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
+    await add_message_to_delete(update.effective_chat.id, message.message_id)
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Отмена диалога"""
-    await update.message.reply_text("Расчет отменен.")
+    await send_message_with_cleanup(update, context, "Расчет отменен.")
     return ConversationHandler.END
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик ошибок"""
     logger.error(f"Ошибка: {context.error}", exc_info=context.error)
     if update and update.effective_message:
-        await update.effective_message.reply_text("❌ Произошла ошибка. Используйте /start для перезапуска.")
+        await send_message_with_cleanup(update, context, "❌ Произошла ошибка. Используйте /start для перезапуска.")
+
+async def scheduled_price_update(context: ContextTypes.DEFAULT_TYPE):
+    """Плановое обновление цен"""
+    logger.info("Запуск планового обновления цен...")
+    load_prices(force_update=True)
+    logger.info("Плановое обновление цен завершено")
 
 def main():
     """Основная функция запуска бота"""
@@ -728,9 +843,19 @@ def main():
         logger.error("❌ TELEGRAM_BOT_TOKEN не найден!")
         return
     
+    # Загружаем цены при запуске
     load_prices()
+    
+    # Создаем приложение
     application = Application.builder().token(token).build()
     
+    # Настраиваем планировщик для автообновления цен
+    job_queue = application.job_queue
+    if job_queue:
+        # Обновлять цены каждые 24 часа
+        job_queue.run_repeating(scheduled_price_update, interval=86400, first=10)
+    
+    # Настраиваем обработчики
     conv_handler = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(button_handler, pattern="^calculate_stairs$"),
@@ -752,10 +877,18 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(button_handler, pattern="^(calculate_stairs|restart)$"))
+    
+    # Обработчик ошибок
     application.add_error_handler(error_handler)
     
     logger.info("🤖 Бот запущен...")
-    application.run_polling()
+    
+    # Запускаем бота
+    application.run_polling(
+        poll_interval=1,
+        timeout=20,
+        drop_pending_updates=True
+    )
 
 if __name__ == "__main__":
     main()
