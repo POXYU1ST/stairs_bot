@@ -8,6 +8,56 @@ from datetime import datetime, timedelta
 import math
 from openpyxl import load_workbook
 import asyncio
+from flask import Flask
+from threading import Thread
+import time
+
+# Replit keep-alive server
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "🚀 Telegram Stair Bot is Alive and Running!"
+
+@app.route('/ping')
+def ping():
+    return "PONG"
+
+@app.route('/status')
+def status():
+    return {
+        "status": "active",
+        "timestamp": datetime.now().isoformat(),
+        "service": "telegram-stair-bot"
+    }
+
+def run_flask():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    """Запускает Flask сервер в отдельном потоке"""
+    t = Thread(target=run_flask)
+    t.daemon = True
+    t.start()
+    logging.info("🔄 Keep-alive server started on port 8080")
+
+def start_ping_loop():
+    """Фоновая задача для само-пинга (опционально)"""
+    def ping_loop():
+        while True:
+            try:
+                # Получаем URL Replit из переменных окружения
+                repl_url = os.getenv('REPLIT_URL')
+                if repl_url:
+                    requests.get(f"{repl_url}/ping", timeout=10)
+                    logging.debug("🔁 Self-ping completed")
+            except Exception as e:
+                logging.debug(f"🔁 Self-ping failed: {e}")
+            time.sleep(300)  # Пинг каждые 5 минут
+    
+    t = Thread(target=ping_loop)
+    t.daemon = True
+    t.start()
 
 # Настройка логирования
 logging.basicConfig(
@@ -819,7 +869,7 @@ async def input_height(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     
     if height_input == "🔄 Перезапустить":
         await restart_from_message(update, context)
-        return ConversationHandler.END
+        return INPUT_HEIGHT
     
     is_valid, result = validate_input(height_input, 1000, 5000, "Высота лестницы")
     
@@ -1010,10 +1060,28 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Основная функция запуска бота"""
+    # Запускаем keep-alive сервер для Replit
+    keep_alive()
+    logger.info("🔄 Keep-alive server started on port 8080")
+    
+    # Опционально: запускаем само-пинг (раскомментируйте если нужно)
+    # start_ping_loop()
+    # logger.info("🔁 Self-ping service started")
+    
+    # Загружаем цены при старте
     load_prices()
     
-    application = Application.builder().token("YOUR_BOT_TOKEN_HERE").build()
+    # Получаем токен
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    if not token:
+        logger.error("❌ TELEGRAM_BOT_TOKEN не найден в Secrets")
+        logger.info("📝 Добавьте TELEGRAM_BOT_TOKEN в раздел Secrets (Tools → Secrets)")
+        return
     
+    # Создаем приложение
+    application = Application.builder().token(token).build()
+    
+    # Обработчик диалога
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler('start', start),
@@ -1039,8 +1107,11 @@ def main():
     application.add_handler(CallbackQueryHandler(restart_bot, pattern='^restart$'))
     application.add_error_handler(error_handler)
     
-    print("Бот запущен...")
-    application.run_polling()
+    logger.info("🚀 Бот запущен и готов к работе!")
+    logger.info("📡 Keep-alive сервер работает на порту 8080")
+    logger.info("🔗 URL для мониторинга: https://your-repl-name.your-username.repl.co")
+    
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
